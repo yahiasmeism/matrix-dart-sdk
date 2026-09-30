@@ -156,17 +156,32 @@ class GroupCallSession {
   }
 
   Future<void> leave() async {
-    setState(GroupCallState.leaving);
-    await removeMemberStateEvent();
-    await backend.dispose(this);
-    setState(GroupCallState.localCallFeedUninitialized);
-    voip.currentGroupCID = null;
-    _participants.clear();
-    voip.groupCalls.remove(VoipId(roomId: room.id, callId: groupCallId));
-    await voip.delegate.handleGroupCallEnded(this);
+    if (state == GroupCallState.leaving || state == GroupCallState.ended) {
+      return;
+    }
+
     _resendMemberStateEventTimer?.cancel();
+    _resendMemberStateEventTimer = null;
     _reactionsTimer?.cancel();
-    setState(GroupCallState.ended);
+    _reactionsTimer = null;
+
+    setState(GroupCallState.leaving);
+
+    try {
+      await removeMemberStateEvent();
+      await backend.dispose(this);
+      setState(GroupCallState.localCallFeedUninitialized);
+      await voip.delegate.handleGroupCallEnded(this);
+    } finally {
+      _resendMemberStateEventTimer?.cancel();
+      _resendMemberStateEventTimer = null;
+      _reactionsTimer?.cancel();
+      _reactionsTimer = null;
+      voip.currentGroupCID = null;
+      _participants.clear();
+      voip.groupCalls.remove(VoipId(roomId: room.id, callId: groupCallId));
+      setState(GroupCallState.ended);
+    }
   }
 
   Future<String?> sendMemberStateEvent() async {
@@ -225,7 +240,7 @@ class GroupCallSession {
       voip.timeouts!.updateExpireTsTimerDuration,
       ((timer) async {
         Logs().d('sendMemberStateEvent updating member event with timer');
-        if (state != GroupCallState.ended ||
+        if (state != GroupCallState.ended &&
             state != GroupCallState.localCallFeedUninitialized) {
           await sendMemberStateEvent();
         } else {

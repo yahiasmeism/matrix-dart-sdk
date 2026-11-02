@@ -90,6 +90,9 @@ class CallSession {
   CallSession? _successor;
   int _toDeviceSeq = 0;
   int _candidateSendTries = 0;
+  int _candidateGeneration = 0;
+  Future<void>? _candidateSendFuture;
+  Timer? _candidateRetryTimer;
   bool get isGroupCall => groupCallId != null;
   bool _missedCall = true;
 
@@ -1212,6 +1215,9 @@ class CallSession {
   }
 
   Future<void> cleanUp() async {
+    _candidateRetryTimer?.cancel();
+    _candidateRetryTimer = null;
+
     try {
       for (final stream in _streams) {
         await stream.dispose();
@@ -1283,6 +1289,10 @@ class CallSession {
   Future<void> restartIce() async {
     Logs().v('[VOIP] iceRestart.');
     // Needs restart ice on session.pc and renegotiation.
+    _candidateGeneration++;
+    _candidateSendTries = 0;
+    _candidateRetryTimer?.cancel();
+    _candidateRetryTimer = null;
     _iceGatheringFinished = false;
     _localCandidates.clear();
     await pc!.restartIce();
@@ -1374,20 +1384,41 @@ class CallSession {
   }
 
   Future<void> _sendCandidateQueue() async {
-    if (callHasEnded) return;
+    if (callHasEnded || _candidateRetryTimer?.isActive == true) {
+      return;
+    }
+    final candidateSendFuture = _candidateSendFuture;
+    if (candidateSendFuture != null) {
+      await candidateSendFuture;
+      return;
+    }
+
+    final sendFuture = _drainCandidateQueue();
+    _candidateSendFuture = sendFuture;
+    try {
+      await sendFuture;
+    } finally {
+      if (identical(_candidateSendFuture, sendFuture)) {
+        _candidateSendFuture = null;
+      }
+    }
+  }
+
+  Future<void> _drainCandidateQueue() async {
     /*
     Currently, trickle-ice is not supported, so it will take a
     long time to wait to collect all the canidates, set the
     timeout for collection canidates to speed up the connection.
     */
-    final candidatesQueue = _localCandidates;
-    try {
-      if (candidatesQueue.isNotEmpty) {
+    while (!callHasEnded && _localCandidates.isNotEmpty) {
+      final candidateGeneration = _candidateGeneration;
+      final candidatesQueue = List<RTCIceCandidate>.of(_localCandidates);
+      _localCandidates.removeRange(0, candidatesQueue.length);
+      try {
         final candidates = <Map<String, dynamic>>[];
         for (final element in candidatesQueue) {
           candidates.add(element.toMap());
         }
-        _localCandidates.clear();
         final res = await sendCallCandidates(
           opts.room,
           callId,
@@ -1395,25 +1426,31 @@ class CallSession {
           candidates,
         );
         Logs().v('[VOIP] sendCallCandidates res => $res');
-      }
-    } catch (e) {
-      Logs().v('[VOIP] sendCallCandidates e => $e');
-      _candidateSendTries++;
-      _localCandidates.clear();
-      _localCandidates.addAll(candidatesQueue);
+        _candidateSendTries = 0;
+      } catch (e) {
+        Logs().v('[VOIP] sendCallCandidates e => $e');
+        if (callHasEnded) return;
+        if (candidateGeneration != _candidateGeneration) continue;
 
-      if (_candidateSendTries > 5) {
-        Logs().d(
-          'Failed to send candidates on attempt $_candidateSendTries Giving up on this call.',
-        );
-        await hangup(reason: CallErrorCode.iceTimeout);
+        _localCandidates.insertAll(0, candidatesQueue);
+        _candidateSendTries++;
+
+        if (_candidateSendTries > 5) {
+          Logs().d(
+            'Failed to send candidates on attempt $_candidateSendTries Giving up on this call.',
+          );
+          await hangup(reason: CallErrorCode.iceTimeout);
+          return;
+        }
+
+        final delay = 500 * pow(2, _candidateSendTries);
+        _candidateRetryTimer?.cancel();
+        _candidateRetryTimer = Timer(Duration(milliseconds: delay as int), () {
+          _candidateRetryTimer = null;
+          unawaited(_sendCandidateQueue());
+        });
         return;
       }
-
-      final delay = 500 * pow(2, _candidateSendTries);
-      Timer(Duration(milliseconds: delay as int), () {
-        unawaited(_sendCandidateQueue());
-      });
     }
   }
 

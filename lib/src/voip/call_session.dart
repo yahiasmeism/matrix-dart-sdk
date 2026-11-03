@@ -31,7 +31,12 @@ enum CallSessionDiagnosticEvent {
   localCandidateSendFailed,
   localCandidateRetryAttempted,
   remoteCandidateBatchReceived,
+  remoteCandidateBatchRecoveredBeforeSession,
   remoteCandidateQueued,
+  remoteDescriptionReady,
+  remoteCandidateQueueFlushStarted,
+  remoteCandidateQueueFlushSucceeded,
+  remoteCandidateQueueFlushFailed,
   remoteCandidateApplied,
   remoteCandidateApplicationFailed,
   answerSignalingStarted,
@@ -283,6 +288,7 @@ class CallSession {
       _updateRemoteSDPStreamMetadata(metadata);
     }
     await pc!.setRemoteDescription(offer);
+    _recordDiagnostic(CallSessionDiagnosticEvent.remoteDescriptionReady);
 
     /// only add local stream if it is not a group call.
     if (!isGroupCall) {
@@ -421,9 +427,8 @@ class CallSession {
     if (direction == CallDirection.kOutgoing) {
       setCallState(CallState.kConnecting);
       await pc!.setRemoteDescription(answer);
-      for (final candidate in _remoteCandidates) {
-        await _applyRemoteCandidate(candidate, preserveFailure: true);
-      }
+      _recordDiagnostic(CallSessionDiagnosticEvent.remoteDescriptionReady);
+      await _flushRemoteCandidateQueue(preserveFailure: true);
     }
     if (remotePartyId != null) {
       /// Send select_answer event.
@@ -463,6 +468,7 @@ class CallSession {
 
     try {
       await pc!.setRemoteDescription(description);
+      _recordDiagnostic(CallSessionDiagnosticEvent.remoteDescriptionReady);
       RTCSessionDescription? answer;
       if (description.type == 'offer') {
         try {
@@ -534,7 +540,15 @@ class CallSession {
     fireCallEvent(CallStateChange.kFeedsChanged);
   }
 
-  Future<void> onCandidatesReceived(List<dynamic> candidates) async {
+  Future<void> onCandidatesReceived(
+    List<dynamic> candidates, {
+    bool recoveredBeforeSession = false,
+  }) async {
+    if (recoveredBeforeSession) {
+      _recordDiagnostic(
+        CallSessionDiagnosticEvent.remoteCandidateBatchRecoveredBeforeSession,
+      );
+    }
     _recordDiagnostic(CallSessionDiagnosticEvent.remoteCandidateBatchReceived);
     for (final json in candidates) {
       final candidate = RTCIceCandidate(
@@ -567,20 +581,57 @@ class CallSession {
     }
   }
 
-  Future<void> _applyRemoteCandidate(
+  Future<bool> _applyRemoteCandidate(
     RTCIceCandidate candidate, {
     bool preserveFailure = false,
   }) async {
     try {
       await pc!.addCandidate(candidate);
       _recordDiagnostic(CallSessionDiagnosticEvent.remoteCandidateApplied);
+      return true;
     } catch (error, stackTrace) {
       _recordDiagnostic(
         CallSessionDiagnosticEvent.remoteCandidateApplicationFailed,
       );
       if (preserveFailure) rethrow;
       Logs().e('[VOIP] onCandidatesReceived => ', error, stackTrace);
+      return false;
     }
+  }
+
+  Future<void> _flushRemoteCandidateQueue({
+    required bool preserveFailure,
+  }) async {
+    if (_remoteCandidates.isEmpty) return;
+
+    _recordDiagnostic(
+      CallSessionDiagnosticEvent.remoteCandidateQueueFlushStarted,
+    );
+    final pending = List<RTCIceCandidate>.of(_remoteCandidates);
+    _remoteCandidates.clear();
+    var nextCandidate = 0;
+    var allApplied = true;
+
+    try {
+      for (; nextCandidate < pending.length; nextCandidate++) {
+        allApplied &= await _applyRemoteCandidate(
+          pending[nextCandidate],
+          preserveFailure: preserveFailure,
+        );
+      }
+    } catch (_) {
+      _remoteCandidates.insertAll(0, pending.skip(nextCandidate));
+      _recordDiagnostic(
+        CallSessionDiagnosticEvent.remoteCandidateQueueFlushFailed,
+      );
+      rethrow;
+    }
+
+    _recordDiagnostic(
+      allApplied
+          ? CallSessionDiagnosticEvent.remoteCandidateQueueFlushSucceeded
+          : CallSessionDiagnosticEvent.remoteCandidateQueueFlushFailed,
+    );
   }
 
   void onAssertedIdentityReceived(AssertedIdentity identity) {
@@ -921,9 +972,7 @@ class CallSession {
       setCallState(CallState.kCreateAnswer);
 
       final answer = await pc!.createAnswer({});
-      for (final candidate in _remoteCandidates) {
-        await _applyRemoteCandidate(candidate, preserveFailure: true);
-      }
+      await _flushRemoteCandidateQueue(preserveFailure: true);
 
       final callCapabilities = CallCapabilities()
         ..dtmf = false
@@ -972,6 +1021,7 @@ class CallSession {
 
       _inviteOrAnswerSent = true;
       _answeredByUs = true;
+      await _flushRemoteCandidateQueue(preserveFailure: false);
     }
   }
 

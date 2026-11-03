@@ -39,6 +39,9 @@ class VoIP {
 
   Map<VoipId, CallSession> get calls => _calls;
   final Map<VoipId, CallSession> _calls = {};
+  static const int _maximumPendingCandidateSessions = 8;
+  static const int _maximumPendingCandidatesPerSession = 64;
+  final Map<VoipId, _PendingCallCandidates> _pendingCallCandidates = {};
 
   Map<VoipId, GroupCallSession> get groupCalls => _groupCalls;
   final Map<VoipId, GroupCallSession> _groupCalls = {};
@@ -270,6 +273,7 @@ class VoIP {
     }
 
     final content = event.content;
+    final partyId = content.tryGet<String>('party_id');
 
     if (client.userID != null &&
         client.deviceID != null &&
@@ -291,7 +295,6 @@ class VoIP {
     }.contains(event.type)) {
       // skip webrtc event checks on encryption_keys
       final callId = content['call_id'] as String?;
-      final partyId = content['party_id'] as String?;
       if (callId == null && event.type.startsWith('m.call')) {
         Logs().w('Ignoring call event ${event.type} because call_id was null');
         return;
@@ -302,6 +305,7 @@ class VoIP {
             !{
               EventTypes.CallInvite,
               EventTypes.GroupCallMemberInvite,
+              EventTypes.CallCandidates,
             }.contains(event.type)) {
           Logs().w(
             'Ignoring call event ${event.type} for room ${room.id} because we do not have the call',
@@ -352,7 +356,12 @@ class VoIP {
         break;
       case EventTypes.CallCandidates:
       case EventTypes.GroupCallMemberCandidates:
-        await onCallCandidates(room, content);
+        await onCallCandidates(
+          room,
+          content,
+          remoteUserId: remoteUserId,
+          remotePartyId: partyId,
+        );
         break;
       case EventTypes.CallHangup:
       case EventTypes.GroupCallMemberHangup:
@@ -543,6 +552,19 @@ class VoIP {
 
     if (confId == null) {
       await delegate.registerListeners(newCall);
+      final pendingCandidates = _removePendingCallCandidates(
+        VoipId(roomId: room.id, callId: callId),
+      );
+      if (pendingCandidates != null &&
+          pendingCandidates.matches(
+            remoteUserId: newCall.remoteUserId,
+            remotePartyId: newCall.remotePartyId,
+          )) {
+        await newCall.onCandidatesReceived(
+          pendingCandidates.candidates,
+          recoveredBeforeSession: true,
+        );
+      }
     } else {
       onIncomingCallSetup.add(newCall);
     }
@@ -627,14 +649,53 @@ class VoIP {
     }
   }
 
-  Future<void> onCallCandidates(Room room, Map<String, dynamic> content) async {
+  Future<void> onCallCandidates(
+    Room room,
+    Map<String, dynamic> content, {
+    String? remoteUserId,
+    String? remotePartyId,
+  }) async {
     Logs().v('[VOIP] onCallCandidates => $content');
     final String callId = content['call_id'];
-    final call = calls[VoipId(roomId: room.id, callId: callId)];
+    final id = VoipId(roomId: room.id, callId: callId);
+    final call = calls[id];
     if (call != null) {
       await call.onCandidatesReceived(content['candidates']);
     } else {
-      Logs().v('[VOIP] onCallCandidates: Session [$callId] not found!');
+      final candidates = List<dynamic>.of(content['candidates'] as List);
+      final pending = _pendingCallCandidates[id];
+      if (pending != null &&
+          !pending.matches(
+            remoteUserId: remoteUserId,
+            remotePartyId: remotePartyId,
+          )) {
+        Logs().w(
+          '[VOIP] onCallCandidates: Ignoring candidate batch from a different sender or party.',
+        );
+        return;
+      }
+      final target =
+          pending ??
+          _PendingCallCandidates(
+            remoteUserId: remoteUserId,
+            remotePartyId: remotePartyId,
+            expirationTimer: Timer(
+              timeouts!.callInviteLifetime,
+              () => _removePendingCallCandidates(id),
+            ),
+          );
+      _pendingCallCandidates[id] = target;
+      final available =
+          _maximumPendingCandidatesPerSession - target.candidates.length;
+      if (available > 0) {
+        target.candidates.addAll(candidates.take(available));
+      }
+      while (_pendingCallCandidates.length > _maximumPendingCandidateSessions) {
+        _removePendingCallCandidates(_pendingCallCandidates.keys.first);
+      }
+      Logs().v(
+        '[VOIP] onCallCandidates: Buffered candidates until session [$callId] exists.',
+      );
     }
   }
 
@@ -643,6 +704,7 @@ class VoIP {
     await delegate.stopRingtone();
     Logs().v('[VOIP] onCallHangup => $content');
     final String callId = content['call_id'];
+    _removePendingCallCandidates(VoipId(roomId: room.id, callId: callId));
 
     final call = calls[VoipId(roomId: room.id, callId: callId)];
     if (call != null) {
@@ -665,6 +727,7 @@ class VoIP {
 
   Future<void> onCallReject(Room room, Map<String, dynamic> content) async {
     final String callId = content['call_id'];
+    _removePendingCallCandidates(VoipId(roomId: room.id, callId: callId));
     Logs().d('Reject received for call ID $callId');
 
     final call = calls[VoipId(roomId: room.id, callId: callId)];
@@ -1151,4 +1214,27 @@ class VoIP {
 
   @Deprecated('Call `hasActiveGroupCall` on the room directly instead')
   bool hasActiveCall(Room room) => room.hasActiveGroupCall(this);
+
+  _PendingCallCandidates? _removePendingCallCandidates(VoipId id) {
+    final pending = _pendingCallCandidates.remove(id);
+    pending?.expirationTimer.cancel();
+    return pending;
+  }
+}
+
+final class _PendingCallCandidates {
+  _PendingCallCandidates({
+    required this.remoteUserId,
+    required this.remotePartyId,
+    required this.expirationTimer,
+  });
+
+  final String? remoteUserId;
+  final String? remotePartyId;
+  final Timer expirationTimer;
+  final List<dynamic> candidates = <dynamic>[];
+
+  bool matches({String? remoteUserId, String? remotePartyId}) =>
+      (this.remoteUserId == null || this.remoteUserId == remoteUserId) &&
+      (this.remotePartyId == null || this.remotePartyId == remotePartyId);
 }

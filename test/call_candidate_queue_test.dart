@@ -6,6 +6,7 @@ import 'dart:async';
 
 import 'package:matrix/matrix.dart';
 import 'package:matrix/src/voip/models/call_options.dart';
+import 'package:matrix/src/voip/models/voip_id.dart';
 import 'package:test/test.dart';
 import 'package:webrtc_interface/webrtc_interface.dart';
 
@@ -15,14 +16,16 @@ import 'webrtc_stub.dart';
 void main() {
   late Client client;
   late Room room;
-  late VoIP voip;
+  late _ControlledVoIP voip;
+  late _CapturingWebRTCDelegate delegate;
   late _ControlledCandidateCall call;
 
   setUp(() async {
     Logs().level = Level.wtf;
     client = await getClient();
     await client.abortSync();
-    voip = VoIP(client, MockWebRTCDelegate());
+    delegate = _CapturingWebRTCDelegate();
+    voip = _ControlledVoIP(client, delegate);
     room = client.getRoomById('!calls:example.com')!;
   });
 
@@ -128,6 +131,8 @@ void main() {
   test('reports remote candidate queueing and application', () async {
     await _withManualCandidateTimers((_) async {
       call = await _createIncomingCall(voip, room, onSend: (_) async => 'sent');
+      final peerConnection = _TrackingPeerConnection();
+      call.pc = peerConnection;
       final events = _observeDiagnostics(call);
       final applied = call.onCallDiagnosticEvent.firstWhere(
         (event) => event == CallSessionDiagnosticEvent.remoteCandidateApplied,
@@ -151,6 +156,266 @@ void main() {
           CallSessionDiagnosticEvent.remoteCandidateApplied,
         ]),
       );
+      expect(peerConnection.appliedCandidates, hasLength(1));
+    });
+  });
+
+  test(
+    'applies a remote candidate arriving while answer is in flight',
+    () async {
+      await _withManualCandidateTimers((_) async {
+        final answerStarted = Completer<void>();
+        final releaseAnswer = Completer<String?>();
+        call = await _createIncomingCall(
+          voip,
+          room,
+          onSend: (_) async => 'sent',
+          onAnswer: () {
+            answerStarted.complete();
+            return releaseAnswer.future;
+          },
+        );
+        final events = _observeDiagnostics(call);
+
+        final answering = call.answer();
+        await answerStarted.future;
+        await call.onCandidatesReceived(<Map<String, dynamic>>[
+          <String, dynamic>{
+            'candidate': 'candidate:1 1 udp 1 203.0.113.20 10003 typ relay',
+            'sdpMid': 'audio',
+            'sdpMLineIndex': 0,
+          },
+        ]);
+        releaseAnswer.complete('answer-sent');
+        await answering;
+        await _flushDiagnostics();
+
+        expect(
+          events,
+          containsAllInOrder(<CallSessionDiagnosticEvent>[
+            CallSessionDiagnosticEvent.remoteCandidateBatchReceived,
+            CallSessionDiagnosticEvent.remoteCandidateQueued,
+            CallSessionDiagnosticEvent.remoteCandidateApplied,
+          ]),
+        );
+      });
+    },
+  );
+
+  test(
+    'recovers candidates received before the incoming session exists',
+    () async {
+      await _deliverCandidateSync(
+        client,
+        room,
+        callId: 'candidate-before-invite',
+        partyId: 'ALICE_PARTY',
+        candidate: 'candidate:1 1 udp 1 203.0.113.20 10003 typ relay',
+      );
+
+      await voip.onCallInvite(
+        room,
+        '@alice:example.com',
+        'ALICE_DEVICE',
+        <String, dynamic>{
+          'lifetime': const Duration(minutes: 1).inMilliseconds,
+          'call_id': 'candidate-before-invite',
+          'party_id': 'ALICE_PARTY',
+          'version': '1',
+          'offer': <String, dynamic>{'type': 'offer', 'sdp': 'offer-sdp'},
+        },
+      );
+      call = voip.latestCall!;
+      await call.answer();
+      await _flushDiagnostics();
+
+      expect(
+        delegate.events,
+        containsAllInOrder(<CallSessionDiagnosticEvent>[
+          CallSessionDiagnosticEvent.remoteCandidateBatchRecoveredBeforeSession,
+          CallSessionDiagnosticEvent.remoteCandidateBatchReceived,
+          CallSessionDiagnosticEvent.remoteCandidateQueued,
+          CallSessionDiagnosticEvent.remoteDescriptionReady,
+          CallSessionDiagnosticEvent.remoteCandidateQueueFlushStarted,
+          CallSessionDiagnosticEvent.remoteCandidateApplied,
+          CallSessionDiagnosticEvent.remoteCandidateQueueFlushSucceeded,
+        ]),
+      );
+    },
+  );
+
+  test(
+    'does not apply stale buffered candidates to a rapid replacement call',
+    () async {
+      await voip.onCallCandidates(room, <String, dynamic>{
+        'call_id': 'old-call',
+        'candidates': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'candidate': 'candidate:1 1 udp 1 192.0.2.10 10000 typ host',
+            'sdpMid': 'audio',
+            'sdpMLineIndex': 0,
+          },
+        ],
+      });
+      await voip.onCallHangup(room, <String, dynamic>{
+        'call_id': 'old-call',
+        'reason': 'user_hangup',
+      });
+      await voip.onCallCandidates(room, <String, dynamic>{
+        'call_id': 'new-call',
+        'candidates': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'candidate': 'candidate:2 1 udp 1 203.0.113.20 10003 typ relay',
+            'sdpMid': 'audio',
+            'sdpMLineIndex': 0,
+          },
+        ],
+      });
+
+      await voip.onCallInvite(
+        room,
+        '@alice:example.com',
+        'ALICE_DEVICE',
+        <String, dynamic>{
+          'lifetime': const Duration(minutes: 1).inMilliseconds,
+          'call_id': 'new-call',
+          'party_id': 'ALICE_PARTY',
+          'version': '1',
+          'offer': <String, dynamic>{'type': 'offer', 'sdp': 'offer-sdp'},
+        },
+      );
+      call = voip.latestCall!;
+      await call.answer();
+
+      expect(
+        delegate.latestPeerConnection!.appliedCandidates.map(
+          (candidate) => candidate.candidate,
+        ),
+        <String>['candidate:2 1 udp 1 203.0.113.20 10003 typ relay'],
+      );
+    },
+  );
+
+  test('rejects pre-session candidates from a different sender', () async {
+    await _deliverCandidateSync(
+      client,
+      room,
+      callId: 'sender-mismatch',
+      partyId: 'MALLORY_PARTY',
+      candidate: 'candidate:1 1 udp 1 192.0.2.10 10000 typ host',
+      senderId: '@mallory:example.com',
+    );
+
+    await voip.onCallInvite(
+      room,
+      '@alice:example.com',
+      'ALICE_DEVICE',
+      <String, dynamic>{
+        'lifetime': const Duration(minutes: 1).inMilliseconds,
+        'call_id': 'sender-mismatch',
+        'party_id': 'ALICE_PARTY',
+        'version': '1',
+        'offer': <String, dynamic>{'type': 'offer', 'sdp': 'offer-sdp'},
+      },
+    );
+    call = voip.latestCall!;
+    await call.answer();
+
+    expect(delegate.latestPeerConnection!.appliedCandidates, isEmpty);
+    expect(
+      delegate.events,
+      isNot(
+        contains(
+          CallSessionDiagnosticEvent.remoteCandidateBatchRecoveredBeforeSession,
+        ),
+      ),
+    );
+  });
+
+  test('expires candidates when the invite never materializes', () async {
+    await _withManualCandidateTimers((timers) async {
+      await voip.onCallCandidates(room, <String, dynamic>{
+        'call_id': 'expired-buffer',
+        'candidates': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'candidate': 'candidate:1 1 udp 1 192.0.2.10 10000 typ host',
+            'sdpMid': 'audio',
+            'sdpMLineIndex': 0,
+          },
+        ],
+      });
+      timers.singleActive(const Duration(seconds: 60)).fire();
+
+      await voip.onCallInvite(
+        room,
+        '@alice:example.com',
+        'ALICE_DEVICE',
+        <String, dynamic>{
+          'lifetime': const Duration(minutes: 1).inMilliseconds,
+          'call_id': 'expired-buffer',
+          'party_id': 'ALICE_PARTY',
+          'version': '1',
+          'offer': <String, dynamic>{'type': 'offer', 'sdp': 'offer-sdp'},
+        },
+      );
+      call = voip.latestCall!;
+      await call.answer();
+
+      expect(delegate.latestPeerConnection!.appliedCandidates, isEmpty);
+      expect(
+        delegate.events,
+        isNot(
+          contains(
+            CallSessionDiagnosticEvent
+                .remoteCandidateBatchRecoveredBeforeSession,
+          ),
+        ),
+      );
+    });
+  });
+
+  test('bounds orphaned candidate sessions by evicting the oldest', () async {
+    await _withManualCandidateTimers((_) async {
+      for (var index = 0; index < 9; index++) {
+        await voip.onCallCandidates(room, <String, dynamic>{
+          'call_id': 'bounded-call-$index',
+          'candidates': <Map<String, dynamic>>[
+            <String, dynamic>{
+              'candidate': 'candidate:$index 1 udp 1 192.0.2.10 10000 typ host',
+              'sdpMid': 'audio',
+              'sdpMLineIndex': 0,
+            },
+          ],
+        });
+      }
+
+      await _inviteIncoming(voip, room, callId: 'bounded-call-0');
+      call = voip.latestCall!;
+      await call.answer();
+
+      expect(delegate.latestPeerConnection!.appliedCandidates, isEmpty);
+    });
+  });
+
+  test('bounds candidates retained for one pending session', () async {
+    await _withManualCandidateTimers((_) async {
+      await voip.onCallCandidates(room, <String, dynamic>{
+        'call_id': 'bounded-candidates',
+        'candidates': List<Map<String, dynamic>>.generate(
+          65,
+          (index) => <String, dynamic>{
+            'candidate': 'candidate:$index 1 udp 1 192.0.2.10 10000 typ host',
+            'sdpMid': 'audio',
+            'sdpMLineIndex': 0,
+          },
+        ),
+      });
+
+      await _inviteIncoming(voip, room, callId: 'bounded-candidates');
+      call = voip.latestCall!;
+      await call.answer();
+
+      expect(delegate.latestPeerConnection!.appliedCandidates, hasLength(64));
     });
   });
 
@@ -403,6 +668,7 @@ Future<_ControlledCandidateCall> _createIncomingCall(
   Room room, {
   required _CandidateSend onSend,
   bool failAnswer = false,
+  Future<String?> Function()? onAnswer,
 }) async {
   final call = _ControlledCandidateCall(
     CallOptions(
@@ -416,6 +682,7 @@ Future<_ControlledCandidateCall> _createIncomingCall(
     ),
     onSend: onSend,
     failAnswer: failAnswer,
+    onAnswer: onAnswer,
   );
   await call.initWithInvite(
     CallType.kVoice,
@@ -439,6 +706,64 @@ List<CallSessionDiagnosticEvent> _observeDiagnostics(CallSession call) {
 
 Future<void> _flushDiagnostics() => Future<void>.delayed(Duration.zero);
 
+Future<void> _deliverCandidateSync(
+  Client client,
+  Room room, {
+  required String callId,
+  required String partyId,
+  required String candidate,
+  String senderId = '@alice:example.com',
+}) async {
+  await client.handleSync(
+    SyncUpdate(
+      nextBatch: 'candidate-before-invite',
+      rooms: RoomsUpdate(
+        join: <String, JoinedRoomUpdate>{
+          room.id: JoinedRoomUpdate(
+            timeline: TimelineUpdate(
+              events: <MatrixEvent>[
+                MatrixEvent(
+                  type: EventTypes.CallCandidates,
+                  content: <String, dynamic>{
+                    'call_id': callId,
+                    'party_id': partyId,
+                    'version': '1',
+                    'candidates': <Map<String, dynamic>>[
+                      <String, dynamic>{
+                        'candidate': candidate,
+                        'sdpMid': 'audio',
+                        'sdpMLineIndex': 0,
+                      },
+                    ],
+                  },
+                  senderId: senderId,
+                  eventId: 'candidate-$callId',
+                  originServerTs: DateTime.now(),
+                ),
+              ],
+            ),
+          ),
+        },
+      ),
+    ),
+  );
+  await Future<void>.delayed(Duration.zero);
+}
+
+Future<void> _inviteIncoming(VoIP voip, Room room, {required String callId}) =>
+    voip.onCallInvite(
+      room,
+      '@alice:example.com',
+      'ALICE_DEVICE',
+      <String, dynamic>{
+        'lifetime': const Duration(minutes: 1).inMilliseconds,
+        'call_id': callId,
+        'party_id': 'ALICE_PARTY',
+        'version': '1',
+        'offer': <String, dynamic>{'type': 'offer', 'sdp': 'offer-sdp'},
+      },
+    );
+
 Future<void> _finishGathering(_ControlledCandidateCall call) async {
   final result = call.pc!.onIceGatheringState!(
     RTCIceGatheringState.RTCIceGatheringStateComplete,
@@ -454,10 +779,12 @@ final class _ControlledCandidateCall extends CallSession {
     super.opts, {
     required this.onSend,
     required this.failAnswer,
+    this.onAnswer,
   });
 
   final _CandidateSend onSend;
   final bool failAnswer;
+  final Future<String?> Function()? onAnswer;
   final List<List<String>> sentCandidateNames = <List<String>>[];
   int sendCount = 0;
   int activeSends = 0;
@@ -476,6 +803,7 @@ final class _ControlledCandidateCall extends CallSession {
     SDPStreamMetadata? metadata,
   }) async {
     if (failAnswer) throw StateError('answer signaling failed');
+    if (onAnswer != null) return onAnswer!();
     return 'answer-sent';
   }
 
@@ -504,6 +832,52 @@ final class _ControlledCandidateCall extends CallSession {
   }
 }
 
+final class _ControlledVoIP extends VoIP {
+  _ControlledVoIP(super.client, super.delegate);
+
+  _ControlledCandidateCall? latestCall;
+
+  @override
+  CallSession createNewCall(CallOptions opts) {
+    final call = _ControlledCandidateCall(
+      opts,
+      onSend: (_) async => 'sent',
+      failAnswer: false,
+    );
+    calls[VoipId(roomId: opts.room.id, callId: opts.callId)] = call;
+    latestCall = call;
+    return call;
+  }
+}
+
+final class _CapturingWebRTCDelegate extends MockWebRTCDelegate {
+  final List<CallSessionDiagnosticEvent> events =
+      <CallSessionDiagnosticEvent>[];
+  _TrackingPeerConnection? latestPeerConnection;
+
+  @override
+  Future<RTCPeerConnection> createPeerConnection(
+    Map<String, dynamic> configuration, [
+    Map<String, dynamic> constraints = const <String, dynamic>{},
+  ]) async => latestPeerConnection = _TrackingPeerConnection();
+
+  @override
+  Future<void> registerListeners(CallSession session) async {
+    session.onCallDiagnosticEvent.listen(events.add);
+    await super.registerListeners(session);
+  }
+}
+
+final class _TrackingPeerConnection extends MockRTCPeerConnection {
+  final List<RTCIceCandidate> appliedCandidates = <RTCIceCandidate>[];
+
+  @override
+  Future<void> addCandidate(RTCIceCandidate candidate) async {
+    appliedCandidates.add(candidate);
+    await super.addCandidate(candidate);
+  }
+}
+
 final class _FailingCandidatePeerConnection extends MockRTCPeerConnection {
   @override
   Future<void> addCandidate(RTCIceCandidate candidate) async {
@@ -520,6 +894,7 @@ Future<T> _withManualCandidateTimers<T>(
     zoneSpecification: ZoneSpecification(
       createTimer: (self, parent, zone, duration, callback) {
         if (duration == const Duration(milliseconds: 500) ||
+            duration == const Duration(seconds: 60) ||
             duration.inSeconds >= 1 && duration.inSeconds <= 16) {
           return timers.create(duration, () => zone.runGuarded(callback));
         }

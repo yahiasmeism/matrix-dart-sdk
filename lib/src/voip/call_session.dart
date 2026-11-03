@@ -7,6 +7,7 @@ import 'dart:core';
 import 'dart:math';
 
 import 'package:collection/collection.dart';
+import 'package:http/http.dart' as http;
 import 'package:matrix/matrix.dart';
 import 'package:matrix/src/utils/cached_stream_controller.dart';
 import 'package:matrix/src/voip/models/call_options.dart';
@@ -29,7 +30,13 @@ enum CallSessionDiagnosticEvent {
   localCandidateSendStarted,
   localCandidateSendSucceeded,
   localCandidateSendFailed,
+  localCandidateSendTimedOut,
+  localCandidateSendRateLimited,
+  localCandidateSendRejected,
+  localCandidateSendTransportFailed,
+  localCandidateSendUnknownFailed,
   localCandidateRetryAttempted,
+  localCandidateRetriesExhausted,
   remoteCandidateBatchReceived,
   remoteCandidateBatchRecoveredBeforeSession,
   remoteCandidateQueued,
@@ -42,6 +49,10 @@ enum CallSessionDiagnosticEvent {
   answerSignalingStarted,
   answerSignalingSucceeded,
   answerSignalingFailed,
+  inviteSignalingStarted,
+  inviteSignalingSucceeded,
+  inviteSignalingFailed,
+  remoteTerminationReceived,
   iceRestartStarted,
   iceRestartCompleted,
   iceRestartFailed,
@@ -1086,6 +1097,9 @@ class CallSession {
     }
 
     Logs().d('[VOIP] terminating call');
+    if (party == CallParty.kRemote) {
+      _recordDiagnostic(CallSessionDiagnosticEvent.remoteTerminationReceived);
+    }
     _inviteTimer?.cancel();
     _inviteTimer = null;
 
@@ -1185,15 +1199,22 @@ class CallSession {
       ..transferee = false;
     final metadata = _getLocalSDPStreamMetadata();
     if (state == CallState.kCreateOffer) {
-      await sendInviteToCall(
-        room,
-        callId,
-        voip.timeouts!.callInviteLifetime.inMilliseconds,
-        localPartyId,
-        offer.sdp!,
-        capabilities: callCapabilities,
-        metadata: metadata,
-      );
+      _recordDiagnostic(CallSessionDiagnosticEvent.inviteSignalingStarted);
+      try {
+        await sendInviteToCall(
+          room,
+          callId,
+          voip.timeouts!.callInviteLifetime.inMilliseconds,
+          localPartyId,
+          offer.sdp!,
+          capabilities: callCapabilities,
+          metadata: metadata,
+        );
+        _recordDiagnostic(CallSessionDiagnosticEvent.inviteSignalingSucceeded);
+      } catch (_) {
+        _recordDiagnostic(CallSessionDiagnosticEvent.inviteSignalingFailed);
+        rethrow;
+      }
       // just incase we ended the call but already sent the invite
       // raraley happens during glares
       if (state == CallState.kEnded) {
@@ -1556,6 +1577,7 @@ class CallSession {
         _candidateSendTries = 0;
       } catch (e) {
         _recordDiagnostic(CallSessionDiagnosticEvent.localCandidateSendFailed);
+        _recordCandidateSendFailure(e);
         Logs().v('[VOIP] sendCallCandidates e => $e');
         if (callHasEnded) return;
         if (candidateGeneration != _candidateGeneration) continue;
@@ -1564,6 +1586,9 @@ class CallSession {
         _candidateSendTries++;
 
         if (_candidateSendTries > 5) {
+          _recordDiagnostic(
+            CallSessionDiagnosticEvent.localCandidateRetriesExhausted,
+          );
           Logs().d(
             'Failed to send candidates on attempt $_candidateSendTries Giving up on this call.',
           );
@@ -1607,6 +1632,21 @@ class CallSession {
   void _recordLocalCandidate(RTCIceCandidate candidate) {
     if (!_callDiagnosticEvents.hasListener) return;
     _recordDiagnostic(_localCandidateEvent(candidate));
+  }
+
+  void _recordCandidateSendFailure(Object error) {
+    final event = switch (error) {
+      TimeoutException() =>
+        CallSessionDiagnosticEvent.localCandidateSendTimedOut,
+      MatrixException(error: MatrixError.M_LIMIT_EXCEEDED) =>
+        CallSessionDiagnosticEvent.localCandidateSendRateLimited,
+      MatrixException() =>
+        CallSessionDiagnosticEvent.localCandidateSendRejected,
+      http.ClientException() =>
+        CallSessionDiagnosticEvent.localCandidateSendTransportFailed,
+      _ => CallSessionDiagnosticEvent.localCandidateSendUnknownFailed,
+    };
+    _recordDiagnostic(event);
   }
 
   void _recordDiagnostic(CallSessionDiagnosticEvent event) {

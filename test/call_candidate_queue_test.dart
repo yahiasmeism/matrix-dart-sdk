@@ -4,6 +4,7 @@
 
 import 'dart:async';
 
+import 'package:http/http.dart' as http;
 import 'package:matrix/matrix.dart';
 import 'package:matrix/src/voip/models/call_options.dart';
 import 'package:matrix/src/voip/models/voip_id.dart';
@@ -104,6 +105,118 @@ void main() {
         ]),
       );
     });
+  });
+
+  final candidateFailures =
+      <({Object error, CallSessionDiagnosticEvent event})>[
+        (
+          error: TimeoutException('candidate timeout'),
+          event: CallSessionDiagnosticEvent.localCandidateSendTimedOut,
+        ),
+        (
+          error: MatrixException.fromJson(<String, Object?>{
+            'errcode': 'M_LIMIT_EXCEEDED',
+          }),
+          event: CallSessionDiagnosticEvent.localCandidateSendRateLimited,
+        ),
+        (
+          error: MatrixException.fromJson(<String, Object?>{
+            'errcode': 'M_FORBIDDEN',
+          }),
+          event: CallSessionDiagnosticEvent.localCandidateSendRejected,
+        ),
+        (
+          error: http.ClientException('transport failed'),
+          event: CallSessionDiagnosticEvent.localCandidateSendTransportFailed,
+        ),
+        (
+          error: StateError('unclassified failure'),
+          event: CallSessionDiagnosticEvent.localCandidateSendUnknownFailed,
+        ),
+      ];
+  for (final (:error, :event) in candidateFailures) {
+    test('classifies candidate send failure as ${event.name}', () async {
+      await _withManualCandidateTimers((_) async {
+        call = await _createIncomingCall(
+          voip,
+          room,
+          onSend: (_) async => throw error,
+        );
+        final events = _observeDiagnostics(call);
+
+        _emitCandidate(call, 'candidate-A');
+        await call.answer();
+        await _finishGathering(call);
+        await _flushDiagnostics();
+
+        expect(
+          events,
+          containsAllInOrder(<CallSessionDiagnosticEvent>[
+            CallSessionDiagnosticEvent.localCandidateSendFailed,
+            event,
+          ]),
+        );
+      });
+    });
+  }
+
+  test('reports permanent candidate send exhaustion', () async {
+    await _withManualCandidateTimers((timers) async {
+      call = await _createIncomingCall(
+        voip,
+        room,
+        onSend: (_) async => throw TimeoutException('candidate timeout'),
+      );
+      final events = _observeDiagnostics(call);
+
+      _emitCandidate(call, 'candidate-A');
+      await call.answer();
+      await _finishGathering(call);
+      for (final delay in <Duration>[
+        const Duration(seconds: 1),
+        const Duration(seconds: 2),
+        const Duration(seconds: 4),
+        const Duration(seconds: 8),
+        const Duration(seconds: 16),
+      ]) {
+        timers.singleActive(delay).fire();
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      expect(call.callHasEnded, isTrue);
+      expect(
+        events,
+        contains(CallSessionDiagnosticEvent.localCandidateRetriesExhausted),
+      );
+    });
+  });
+
+  test('reports a remote terminal boundary before cleanup', () async {
+    call = await _createIncomingCall(voip, room, onSend: (_) async => 'sent');
+    final events = _observeDiagnostics(call);
+
+    await call.terminate(CallParty.kRemote, CallErrorCode.userHangup, false);
+
+    expect(
+      events,
+      contains(CallSessionDiagnosticEvent.remoteTerminationReceived),
+    );
+  });
+
+  test('reports outgoing invite signaling boundaries', () async {
+    call =
+        await voip.inviteToCall(room, CallType.kVoice)
+            as _ControlledCandidateCall;
+    await call.onNegotiationNeeded();
+    await _flushDiagnostics();
+
+    expect(
+      delegate.events,
+      containsAllInOrder(<CallSessionDiagnosticEvent>[
+        CallSessionDiagnosticEvent.inviteSignalingStarted,
+        CallSessionDiagnosticEvent.inviteSignalingSucceeded,
+      ]),
+    );
   });
 
   test('reports only the coarse local candidate type', () async {
@@ -700,9 +813,11 @@ void main() {
       ..restartGate = restartGate
       ..throwAfterRestartGate = true;
 
-    final callback = connection.onIceConnectionState!(
-      RTCIceConnectionState.RTCIceConnectionStateFailed,
-    )! as Future<void>;
+    final callback =
+        connection.onIceConnectionState!(
+              RTCIceConnectionState.RTCIceConnectionStateFailed,
+            )!
+            as Future<void>;
     await connection.restartStarted.future;
     await call.terminate(CallParty.kLocal, CallErrorCode.userHangup, false);
     restartGate.complete();
@@ -838,6 +953,20 @@ final class _ControlledCandidateCall extends CallSession {
   int sendCount = 0;
   int activeSends = 0;
   int maxConcurrentSends = 0;
+
+  @override
+  Future<String?> sendInviteToCall(
+    Room room,
+    String callId,
+    int lifetime,
+    String partyId,
+    String sdp, {
+    String type = 'offer',
+    String version = voipProtoVersion,
+    String? txid,
+    CallCapabilities? capabilities,
+    SDPStreamMetadata? metadata,
+  }) async => 'invite-sent';
 
   @override
   Future<String?> sendAnswerCall(

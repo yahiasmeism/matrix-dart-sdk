@@ -1051,7 +1051,9 @@ class CallSession {
     setCallState(CallState.kEnding);
     await terminate(CallParty.kLocal, CallErrorCode.userHangup, shouldEmit);
     if (shouldEmit) {
-      await sendCallReject(room, callId, localPartyId);
+      await _sendTerminalEvent(
+        (txid) => sendCallReject(room, callId, localPartyId, txid: txid),
+      );
     }
   }
 
@@ -1061,16 +1063,35 @@ class CallSession {
   }) async {
     setCallState(CallState.kEnding);
     await terminate(CallParty.kLocal, reason, shouldEmit);
+    if (!shouldEmit) return;
+
+    final res = await _sendTerminalEvent(
+      (txid) =>
+          sendHangupCall(room, callId, localPartyId, reason.reason, txid: txid),
+    );
+    Logs().v('[VOIP] hangup res => $res');
+  }
+
+  Future<String?> _sendTerminalEvent(
+    Future<String?> Function(String txid) send,
+  ) async {
+    final txid = VoIP.customTxid ?? client.generateUniqueTransactionId();
     try {
-      final res = await sendHangupCall(
-        room,
-        callId,
-        localPartyId,
-        'userHangup',
-      );
-      Logs().v('[VOIP] hangup res => $res');
-    } catch (e) {
-      Logs().v('[VOIP] hangup error => $e');
+      return await send(txid);
+    } on MatrixException catch (error) {
+      final retryAfterMs = error.retryAfterMs;
+      if (error.error != MatrixError.M_LIMIT_EXCEEDED ||
+          retryAfterMs == null ||
+          retryAfterMs < 0 ||
+          Duration(milliseconds: retryAfterMs) >
+              voip.timeouts!.callInviteLifetime) {
+        rethrow;
+      }
+
+      if (retryAfterMs > 0) {
+        await Future<void>.delayed(Duration(milliseconds: retryAfterMs));
+      }
+      return send(txid);
     }
   }
 

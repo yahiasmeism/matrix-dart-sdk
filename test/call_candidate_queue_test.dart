@@ -825,6 +825,102 @@ void main() {
     await expectLater(callback, completes);
     expect(call.state, CallState.kEnded);
   });
+
+  test(
+    'hangup forwards the protocol reason and surfaces final failure',
+    () async {
+      String? observedReason;
+      call = await _createIncomingCall(
+        voip,
+        room,
+        onSend: (_) async => 'sent',
+        onHangup: (reason, _) async {
+          observedReason = reason;
+          throw StateError('terminal signaling failed');
+        },
+      );
+
+      await expectLater(
+        call.hangup(reason: CallErrorCode.iceTimeout),
+        throwsStateError,
+      );
+
+      expect(observedReason, CallErrorCode.iceTimeout.reason);
+      expect(call.state, CallState.kEnded);
+    },
+  );
+
+  test(
+    'hangup retries one rate-limited request with the same transaction',
+    () async {
+      final transactions = <String?>[];
+      var attempts = 0;
+      call = await _createIncomingCall(
+        voip,
+        room,
+        onSend: (_) async => 'sent',
+        onHangup: (_, txid) async {
+          transactions.add(txid);
+          attempts++;
+          if (attempts == 1) {
+            throw MatrixException.fromJson(<String, Object?>{
+              'errcode': 'M_LIMIT_EXCEEDED',
+              'retry_after_ms': 0,
+            });
+          }
+          return 'sent';
+        },
+      );
+
+      await call.hangup(reason: CallErrorCode.userHangup);
+
+      expect(attempts, 2);
+      expect(transactions.first, isNotNull);
+      expect(transactions.toSet(), hasLength(1));
+    },
+  );
+
+  test('hangup with emission disabled performs local cleanup only', () async {
+    var sends = 0;
+    call = await _createIncomingCall(
+      voip,
+      room,
+      onSend: (_) async => 'sent',
+      onHangup: (_, _) async {
+        sends++;
+        return 'sent';
+      },
+    );
+
+    await call.hangup(reason: CallErrorCode.userHangup, shouldEmit: false);
+
+    expect(sends, 0);
+    expect(call.state, CallState.kEnded);
+  });
+
+  test('reject uses the bounded rate-limit retry path', () async {
+    var attempts = 0;
+    call = await _createIncomingCall(
+      voip,
+      room,
+      onSend: (_) async => 'sent',
+      onReject: (_) async {
+        attempts++;
+        if (attempts == 1) {
+          throw MatrixException.fromJson(<String, Object?>{
+            'errcode': 'M_LIMIT_EXCEEDED',
+            'retry_after_ms': 0,
+          });
+        }
+        return 'sent';
+      },
+    );
+
+    await call.reject();
+
+    expect(attempts, 2);
+    expect(call.state, CallState.kEnded);
+  });
 }
 
 Future<_ControlledCandidateCall> _createIncomingCall(
@@ -833,6 +929,8 @@ Future<_ControlledCandidateCall> _createIncomingCall(
   required _CandidateSend onSend,
   bool failAnswer = false,
   Future<String?> Function()? onAnswer,
+  Future<String?> Function(String? reason, String? txid)? onHangup,
+  Future<String?> Function(String? txid)? onReject,
 }) async {
   final call = _ControlledCandidateCall(
     CallOptions(
@@ -847,6 +945,8 @@ Future<_ControlledCandidateCall> _createIncomingCall(
     onSend: onSend,
     failAnswer: failAnswer,
     onAnswer: onAnswer,
+    onHangup: onHangup,
+    onReject: onReject,
   );
   await call.initWithInvite(
     CallType.kVoice,
@@ -944,11 +1044,15 @@ final class _ControlledCandidateCall extends CallSession {
     required this.onSend,
     required this.failAnswer,
     this.onAnswer,
+    this.onHangup,
+    this.onReject,
   });
 
   final _CandidateSend onSend;
   final bool failAnswer;
   final Future<String?> Function()? onAnswer;
+  final Future<String?> Function(String? reason, String? txid)? onHangup;
+  final Future<String?> Function(String? txid)? onReject;
   final List<List<String>> sentCandidateNames = <List<String>>[];
   int sendCount = 0;
   int activeSends = 0;
@@ -1007,6 +1111,33 @@ final class _ControlledCandidateCall extends CallSession {
     } finally {
       activeSends--;
     }
+  }
+
+  @override
+  Future<String?> sendHangupCall(
+    Room room,
+    String callId,
+    String partyId,
+    String? hangupCause, {
+    String version = voipProtoVersion,
+    String? txid,
+  }) {
+    final callback = onHangup;
+    if (callback != null) return callback(hangupCause, txid);
+    return Future<String?>.value('hangup-sent');
+  }
+
+  @override
+  Future<String?> sendCallReject(
+    Room room,
+    String callId,
+    String partyId, {
+    String version = voipProtoVersion,
+    String? txid,
+  }) {
+    final callback = onReject;
+    if (callback != null) return callback(txid);
+    return Future<String?>.value('reject-sent');
   }
 }
 

@@ -661,6 +661,55 @@ void main() {
       expect(call.sendCount, 1);
     });
   });
+
+  test('late ICE connected event cannot resurrect a terminated call', () async {
+    call = await _createIncomingCall(voip, room, onSend: (_) async => 'sent');
+    final connection = call.pc!;
+
+    await call.terminate(CallParty.kLocal, CallErrorCode.userHangup, false);
+    final callback = connection.onIceConnectionState!(
+      RTCIceConnectionState.RTCIceConnectionStateConnected,
+    );
+    if (callback is Future<void>) await callback;
+
+    expect(call.state, CallState.kEnded);
+  });
+
+  test('late ICE failure cannot restart a terminated call', () async {
+    call = await _createIncomingCall(voip, room, onSend: (_) async => 'sent');
+    final connection = call.pc!;
+    final events = _observeDiagnostics(call);
+
+    await call.terminate(CallParty.kLocal, CallErrorCode.userHangup, false);
+    final callback = connection.onIceConnectionState!(
+      RTCIceConnectionState.RTCIceConnectionStateFailed,
+    );
+    if (callback is Future<void>) await callback;
+
+    expect(
+      events,
+      isNot(contains(CallSessionDiagnosticEvent.iceRestartStarted)),
+    );
+  });
+
+  test('termination contains an overlapping ICE restart failure', () async {
+    call = await _createIncomingCall(voip, room, onSend: (_) async => 'sent');
+    final connection = call.pc! as _TrackingPeerConnection;
+    final restartGate = Completer<void>();
+    connection
+      ..restartGate = restartGate
+      ..throwAfterRestartGate = true;
+
+    final callback = connection.onIceConnectionState!(
+      RTCIceConnectionState.RTCIceConnectionStateFailed,
+    )! as Future<void>;
+    await connection.restartStarted.future;
+    await call.terminate(CallParty.kLocal, CallErrorCode.userHangup, false);
+    restartGate.complete();
+
+    await expectLater(callback, completes);
+    expect(call.state, CallState.kEnded);
+  });
 }
 
 Future<_ControlledCandidateCall> _createIncomingCall(
@@ -870,11 +919,22 @@ final class _CapturingWebRTCDelegate extends MockWebRTCDelegate {
 
 final class _TrackingPeerConnection extends MockRTCPeerConnection {
   final List<RTCIceCandidate> appliedCandidates = <RTCIceCandidate>[];
+  final Completer<void> restartStarted = Completer<void>();
+  Completer<void>? restartGate;
+  bool throwAfterRestartGate = false;
 
   @override
   Future<void> addCandidate(RTCIceCandidate candidate) async {
     appliedCandidates.add(candidate);
     await super.addCandidate(candidate);
+  }
+
+  @override
+  Future<void> restartIce() async {
+    if (!restartStarted.isCompleted) restartStarted.complete();
+    await restartGate?.future;
+    if (throwAfterRestartGate) throw StateError('peer connection disposed');
+    await super.restartIce();
   }
 }
 

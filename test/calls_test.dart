@@ -288,7 +288,7 @@ void main() {
                         'party_id': 'GHTYAJCE_caller',
                         'version': '1',
                         'lifetime': 10000,
-                        'selected_party_id': 'GHTYAJCE',
+                        'selected_party_id': call.localPartyId,
                       },
                       senderId: '@alice:testing.com',
                       eventId: 'callerSelectAnswerEvent',

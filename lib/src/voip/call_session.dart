@@ -1292,6 +1292,7 @@ class CallSession {
       };
       pc!.onIceConnectionState = (RTCIceConnectionState state) async {
         Logs().v('[VOIP] RTCIceConnectionState => $state');
+        if (callHasEnded) return;
         if (state == RTCIceConnectionState.RTCIceConnectionStateConnected) {
           _localCandidates.clear();
           _remoteCandidates.clear();
@@ -1305,7 +1306,13 @@ class CallSession {
           RTCIceConnectionState.RTCIceConnectionStateDisconnected,
         }.contains(state)) {
           if (iceRestartedCount < 3) {
-            await restartIce();
+            try {
+              await restartIce();
+            } catch (_) {
+              if (callHasEnded) return;
+              rethrow;
+            }
+            if (callHasEnded) return;
             iceRestartedCount++;
           } else {
             await hangup(reason: CallErrorCode.iceFailed);

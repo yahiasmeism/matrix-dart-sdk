@@ -15,6 +15,33 @@ import 'package:matrix/src/voip/utils/stream_helper.dart';
 import 'package:matrix/src/voip/utils/user_media_constraints.dart';
 import 'package:webrtc_interface/webrtc_interface.dart';
 
+/// Privacy-safe call establishment events for opt-in diagnostics.
+///
+/// These events deliberately expose no candidate values, network addresses,
+/// SDP, Matrix identifiers, credentials, or error descriptions.
+enum CallSessionDiagnosticEvent {
+  localHostCandidateGenerated,
+  localServerReflexiveCandidateGenerated,
+  localPeerReflexiveCandidateGenerated,
+  localRelayCandidateGenerated,
+  localCandidateGeneratedUnknown,
+  localCandidateBatchQueued,
+  localCandidateSendStarted,
+  localCandidateSendSucceeded,
+  localCandidateSendFailed,
+  localCandidateRetryAttempted,
+  remoteCandidateBatchReceived,
+  remoteCandidateQueued,
+  remoteCandidateApplied,
+  remoteCandidateApplicationFailed,
+  answerSignalingStarted,
+  answerSignalingSucceeded,
+  answerSignalingFailed,
+  iceRestartStarted,
+  iceRestartCompleted,
+  iceRestartFailed,
+}
+
 /// Parses incoming matrix events to the apropriate webrtc layer underneath using
 /// a `WebRTCDelegate`. This class is also responsible for sending any outgoing
 /// matrix events if required (f.ex m.call.answer).
@@ -110,6 +137,13 @@ class CallSession {
 
   final CachedStreamController<CallStateChange> onCallEventChanged =
       CachedStreamController();
+
+  final StreamController<CallSessionDiagnosticEvent> _callDiagnosticEvents =
+      StreamController<CallSessionDiagnosticEvent>.broadcast();
+
+  /// Coarse diagnostics only. This stream never participates in call control.
+  Stream<CallSessionDiagnosticEvent> get onCallDiagnosticEvent =>
+      _callDiagnosticEvents.stream;
 
   final CachedStreamController<WrappedMediaStream> onStreamAdd =
       CachedStreamController();
@@ -388,7 +422,7 @@ class CallSession {
       setCallState(CallState.kConnecting);
       await pc!.setRemoteDescription(answer);
       for (final candidate in _remoteCandidates) {
-        await pc!.addCandidate(candidate);
+        await _applyRemoteCandidate(candidate, preserveFailure: true);
       }
     }
     if (remotePartyId != null) {
@@ -501,6 +535,7 @@ class CallSession {
   }
 
   Future<void> onCandidatesReceived(List<dynamic> candidates) async {
+    _recordDiagnostic(CallSessionDiagnosticEvent.remoteCandidateBatchReceived);
     for (final json in candidates) {
       final candidate = RTCIceCandidate(
         json['candidate'],
@@ -519,18 +554,32 @@ class CallSession {
           pc != null &&
           await pc!.getRemoteDescription() == null) {
         _remoteCandidates.add(candidate);
+        _recordDiagnostic(CallSessionDiagnosticEvent.remoteCandidateQueued);
         continue;
       }
 
       if (pc != null && _inviteOrAnswerSent) {
-        try {
-          await pc!.addCandidate(candidate);
-        } catch (e, s) {
-          Logs().e('[VOIP] onCandidatesReceived => ', e, s);
-        }
+        await _applyRemoteCandidate(candidate);
       } else {
         _remoteCandidates.add(candidate);
+        _recordDiagnostic(CallSessionDiagnosticEvent.remoteCandidateQueued);
       }
+    }
+  }
+
+  Future<void> _applyRemoteCandidate(
+    RTCIceCandidate candidate, {
+    bool preserveFailure = false,
+  }) async {
+    try {
+      await pc!.addCandidate(candidate);
+      _recordDiagnostic(CallSessionDiagnosticEvent.remoteCandidateApplied);
+    } catch (error, stackTrace) {
+      _recordDiagnostic(
+        CallSessionDiagnosticEvent.remoteCandidateApplicationFailed,
+      );
+      if (preserveFailure) rethrow;
+      Logs().e('[VOIP] onCandidatesReceived => ', error, stackTrace);
     }
   }
 
@@ -873,7 +922,7 @@ class CallSession {
 
       final answer = await pc!.createAnswer({});
       for (final candidate in _remoteCandidates) {
-        await pc!.addCandidate(candidate);
+        await _applyRemoteCandidate(candidate, preserveFailure: true);
       }
 
       final callCapabilities = CallCapabilities()
@@ -901,16 +950,24 @@ class CallSession {
       // Allow a short time for initial candidates to be gathered
       await Future.delayed(Duration(milliseconds: 200));
 
-      final res = await sendAnswerCall(
-        room,
-        callId,
-        answer.sdp!,
-        localPartyId,
-        type: answer.type!,
-        capabilities: callCapabilities,
-        metadata: metadata,
-        txid: txid,
-      );
+      _recordDiagnostic(CallSessionDiagnosticEvent.answerSignalingStarted);
+      late final String? res;
+      try {
+        res = await sendAnswerCall(
+          room,
+          callId,
+          answer.sdp!,
+          localPartyId,
+          type: answer.type!,
+          capabilities: callCapabilities,
+          metadata: metadata,
+          txid: txid,
+        );
+        _recordDiagnostic(CallSessionDiagnosticEvent.answerSignalingSucceeded);
+      } catch (_) {
+        _recordDiagnostic(CallSessionDiagnosticEvent.answerSignalingFailed);
+        rethrow;
+      }
       Logs().v('[VOIP] answer res => $res');
 
       _inviteOrAnswerSent = true;
@@ -1151,6 +1208,7 @@ class CallSession {
 
       pc!.onIceCandidate = (RTCIceCandidate candidate) async {
         if (callHasEnded) return;
+        _recordLocalCandidate(candidate);
         _localCandidates.add(candidate);
 
         if (state == CallState.kRinging || !_inviteOrAnswerSent) return;
@@ -1288,6 +1346,7 @@ class CallSession {
 
   Future<void> restartIce() async {
     Logs().v('[VOIP] iceRestart.');
+    _recordDiagnostic(CallSessionDiagnosticEvent.iceRestartStarted);
     // Needs restart ice on session.pc and renegotiation.
     _candidateGeneration++;
     _candidateSendTries = 0;
@@ -1295,7 +1354,13 @@ class CallSession {
     _candidateRetryTimer = null;
     _iceGatheringFinished = false;
     _localCandidates.clear();
-    await pc!.restartIce();
+    try {
+      await pc!.restartIce();
+      _recordDiagnostic(CallSessionDiagnosticEvent.iceRestartCompleted);
+    } catch (_) {
+      _recordDiagnostic(CallSessionDiagnosticEvent.iceRestartFailed);
+      rethrow;
+    }
   }
 
   Future<MediaStream?> _getUserMedia(CallType type) async {
@@ -1414,20 +1479,26 @@ class CallSession {
       final candidateGeneration = _candidateGeneration;
       final candidatesQueue = List<RTCIceCandidate>.of(_localCandidates);
       _localCandidates.removeRange(0, candidatesQueue.length);
+      _recordDiagnostic(CallSessionDiagnosticEvent.localCandidateBatchQueued);
       try {
         final candidates = <Map<String, dynamic>>[];
         for (final element in candidatesQueue) {
           candidates.add(element.toMap());
         }
+        _recordDiagnostic(CallSessionDiagnosticEvent.localCandidateSendStarted);
         final res = await sendCallCandidates(
           opts.room,
           callId,
           localPartyId,
           candidates,
         );
+        _recordDiagnostic(
+          CallSessionDiagnosticEvent.localCandidateSendSucceeded,
+        );
         Logs().v('[VOIP] sendCallCandidates res => $res');
         _candidateSendTries = 0;
       } catch (e) {
+        _recordDiagnostic(CallSessionDiagnosticEvent.localCandidateSendFailed);
         Logs().v('[VOIP] sendCallCandidates e => $e');
         if (callHasEnded) return;
         if (candidateGeneration != _candidateGeneration) continue;
@@ -1447,10 +1518,46 @@ class CallSession {
         _candidateRetryTimer?.cancel();
         _candidateRetryTimer = Timer(Duration(milliseconds: delay as int), () {
           _candidateRetryTimer = null;
+          _recordDiagnostic(
+            CallSessionDiagnosticEvent.localCandidateRetryAttempted,
+          );
           unawaited(_sendCandidateQueue());
         });
         return;
       }
+    }
+  }
+
+  CallSessionDiagnosticEvent _localCandidateEvent(RTCIceCandidate candidate) {
+    final value = candidate.candidate;
+    if (value == null) {
+      return CallSessionDiagnosticEvent.localCandidateGeneratedUnknown;
+    }
+    final type = RegExp(
+      r'(?:^|\s)typ\s+(host|srflx|prflx|relay)(?:\s|$)',
+    ).firstMatch(value)?.group(1);
+    return switch (type) {
+      'host' => CallSessionDiagnosticEvent.localHostCandidateGenerated,
+      'srflx' =>
+        CallSessionDiagnosticEvent.localServerReflexiveCandidateGenerated,
+      'prflx' =>
+        CallSessionDiagnosticEvent.localPeerReflexiveCandidateGenerated,
+      'relay' => CallSessionDiagnosticEvent.localRelayCandidateGenerated,
+      _ => CallSessionDiagnosticEvent.localCandidateGeneratedUnknown,
+    };
+  }
+
+  void _recordLocalCandidate(RTCIceCandidate candidate) {
+    if (!_callDiagnosticEvents.hasListener) return;
+    _recordDiagnostic(_localCandidateEvent(candidate));
+  }
+
+  void _recordDiagnostic(CallSessionDiagnosticEvent event) {
+    if (!_callDiagnosticEvents.hasListener) return;
+    try {
+      _callDiagnosticEvents.add(event);
+    } catch (_) {
+      // Optional diagnostics must never affect call behavior.
     }
   }
 

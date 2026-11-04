@@ -135,6 +135,7 @@ class CallSession {
   int _candidateSendTries = 0;
   int _candidateGeneration = 0;
   Future<void>? _candidateSendFuture;
+  Future<void>? _answerFuture;
   Timer? _candidateRetryTimer;
   bool get isGroupCall => groupCallId != null;
   bool _missedCall = true;
@@ -300,20 +301,6 @@ class CallSession {
     }
     await pc!.setRemoteDescription(offer);
     _recordDiagnostic(CallSessionDiagnosticEvent.remoteDescriptionReady);
-
-    /// only add local stream if it is not a group call.
-    if (!isGroupCall) {
-      final stream = await _getUserMedia(type);
-      if (stream != null) {
-        await addLocalStream(stream, SDPStreamMetadataPurpose.Usermedia);
-      } else {
-        // we don't have a localstream, call probably crashed
-        // for sanity
-        if (state == CallState.kEnded) {
-          return;
-        }
-      }
-    }
 
     setCallState(CallState.kRinging);
 
@@ -972,14 +959,38 @@ class CallSession {
     return callOnHold;
   }
 
-  Future<void> answer({String? txid}) async {
+  Future<void> answer({String? txid}) {
     if (_inviteOrAnswerSent) {
-      return;
+      return Future<void>.value();
     }
+
+    final answerFuture = _answerFuture;
+    if (answerFuture != null) return answerFuture;
+
+    final operation = _answer(txid: txid);
+    _answerFuture = operation;
+    return operation.whenComplete(() {
+      if (identical(_answerFuture, operation)) _answerFuture = null;
+    });
+  }
+
+  Future<void> _answer({String? txid}) async {
     // stop play ringtone
     await voip.delegate.stopRingtone();
 
     if (direction == CallDirection.kIncoming) {
+      if (!isGroupCall && localUserMediaStream == null) {
+        final stream = await _getUserMedia(type);
+        if (state == CallState.kEnded) {
+          await stream?.dispose();
+          return;
+        }
+        if (stream != null) {
+          await addLocalStream(stream, SDPStreamMetadataPurpose.Usermedia);
+        }
+        if (state == CallState.kEnded) return;
+      }
+
       setCallState(CallState.kCreateAnswer);
 
       final answer = await pc!.createAnswer({});

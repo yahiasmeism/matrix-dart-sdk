@@ -219,6 +219,51 @@ void main() {
     );
   });
 
+  test('incoming media is acquired only when the call is answered', () async {
+    call = await _createIncomingCall(voip, room, onSend: (_) async => 'sent');
+
+    expect(delegate.trackingMediaDevices.userMediaRequests, 0);
+
+    await call.answer();
+
+    expect(delegate.trackingMediaDevices.userMediaRequests, 1);
+  });
+
+  test(
+    'termination during incoming media acquisition disposes the stream',
+    () async {
+      final mediaGate = Completer<void>();
+      delegate.trackingMediaDevices.gate = mediaGate;
+      call = await _createIncomingCall(voip, room, onSend: (_) async => 'sent');
+
+      final answering = call.answer();
+      await delegate.trackingMediaDevices.requestStarted.future;
+      await call.hangup(reason: CallErrorCode.userHangup, shouldEmit: false);
+      mediaGate.complete();
+      await answering;
+
+      expect(delegate.trackingMediaDevices.lastStream?.active, isFalse);
+      expect(call.state, CallState.kEnded);
+    },
+  );
+
+  test('concurrent answers acquire incoming media only once', () async {
+    final mediaGate = Completer<void>();
+    delegate.trackingMediaDevices.gate = mediaGate;
+    call = await _createIncomingCall(voip, room, onSend: (_) async => 'sent');
+
+    final firstAnswer = call.answer();
+    await delegate.trackingMediaDevices.requestStarted.future;
+    final secondAnswer = call.answer();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(delegate.trackingMediaDevices.userMediaRequests, 1);
+
+    mediaGate.complete();
+    await Future.wait<void>(<Future<void>>[firstAnswer, secondAnswer]);
+    expect(delegate.trackingMediaDevices.userMediaRequests, 1);
+  });
+
   test('reports only the coarse local candidate type', () async {
     await _withManualCandidateTimers((_) async {
       call = await _createIncomingCall(voip, room, onSend: (_) async => 'sent');
@@ -1162,7 +1207,11 @@ final class _ControlledVoIP extends VoIP {
 final class _CapturingWebRTCDelegate extends MockWebRTCDelegate {
   final List<CallSessionDiagnosticEvent> events =
       <CallSessionDiagnosticEvent>[];
+  final _TrackingMediaDevices trackingMediaDevices = _TrackingMediaDevices();
   _TrackingPeerConnection? latestPeerConnection;
+
+  @override
+  MediaDevices get mediaDevices => trackingMediaDevices;
 
   @override
   Future<RTCPeerConnection> createPeerConnection(
@@ -1174,6 +1223,23 @@ final class _CapturingWebRTCDelegate extends MockWebRTCDelegate {
   Future<void> registerListeners(CallSession session) async {
     session.onCallDiagnosticEvent.listen(events.add);
     await super.registerListeners(session);
+  }
+}
+
+final class _TrackingMediaDevices extends MockMediaDevices {
+  int userMediaRequests = 0;
+  Completer<void>? gate;
+  final Completer<void> requestStarted = Completer<void>();
+  MediaStream? lastStream;
+
+  @override
+  Future<MediaStream> getUserMedia(
+    Map<String, dynamic> mediaConstraints,
+  ) async {
+    userMediaRequests++;
+    if (!requestStarted.isCompleted) requestStarted.complete();
+    await gate?.future;
+    return lastStream = await super.getUserMedia(mediaConstraints);
   }
 }
 
